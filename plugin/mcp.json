@@ -1,0 +1,8 @@
+{
+  "servers": {
+    "memvara": {
+      "type": "http",
+      "url": "https://app.memvara.dev/mcp"
+    }
+  }
+}
