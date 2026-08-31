@@ -7,8 +7,21 @@ Add this repository as a Copilot / VS Code plugin marketplace and
 install `memvara`.
 
 The first connection opens a browser so you can click Allow. That grant
-lasts 90 days. There is no local Python process and we do not use an
-API key.
+lasts 90 days. Nothing runs in the background and no API key ships in the
+plugin files.
+
+## When the browser sign-in will not finish
+
+The skill ships `skills/memvara/scripts/memvara_auth.py`: the device-code
+flow, standard library only, no `pip install`, and nothing left running
+when it returns. Ask Copilot to authenticate memvara and it runs the
+script, which prints a short code and a URL for you to approve and then
+writes `~/.memvara/credentials.json`. It also does `logout` and `stats`.
+
+A Copilot plugin cannot ship slash commands — the documented components
+are agents, skills, hooks, MCP servers and LSP servers — so there is no
+`/memvara authenticate` here. Asking in words is the interface on this
+host.
 
 The config key is `servers`, not `mcpServers`. A block copied from
 Cursor will parse and do nothing.
