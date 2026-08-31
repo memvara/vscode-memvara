@@ -12,6 +12,7 @@ import pathlib
 import re
 import ssl
 import subprocess
+import sys
 import unittest
 import urllib.request
 
@@ -460,8 +461,45 @@ class Version(unittest.TestCase):
             "the single place the suite states the release")
 
 
-if __name__ == "__main__":
-    unittest.main()
+def _readme_prose(root: pathlib.Path) -> str:
+    """The README with every run of whitespace collapsed to one space.
+
+    Prose wraps, and where it wraps is not a fact about what it says. Matching the raw
+    text pinned a line break: reflowing a paragraph turned a guard red while the sentence
+    it guards was present and correct, and the cheapest way out of that is to delete the
+    guard. It matters for the negative assertion too -- a claim reintroduced with a
+    different wrap would slip past `assertNotIn` on the raw text.
+    """
+    return " ".join(root.joinpath("README.md").read_text(encoding="utf-8").split())
+
+
+class ModuleShape(unittest.TestCase):
+    """Nothing may be defined below `unittest.main()`.
+
+    Measured, not imagined: `AuthScript` was appended to the end of this file, after the
+    `__main__` block. Under `unittest discover` the module is imported, the block does not
+    run, and every test is collected. Run directly -- `python3 test/test_plugin.py`, the
+    obvious way to check one file -- `unittest.main()` executes before the class exists
+    and five guards silently do not run. Both invocations printed `OK`: 26 tests one way
+    and 21 the other, with nothing in the output saying so.
+
+    That is this repository's signature failure in miniature, so it gets a guard rather
+    than a fixed comment: a passing run must not be able to mean "the check never ran".
+    """
+
+    def test_nothing_is_defined_after_the_main_block(self) -> None:
+        import ast
+
+        source = pathlib.Path(__file__).read_text(encoding="utf-8")
+        body = ast.parse(source).body
+        guards = [i for i, node in enumerate(body)
+                  if isinstance(node, ast.If) and "__main__" in ast.dump(node.test)]
+        self.assertEqual(len(guards), 1, "expected exactly one __main__ block")
+        after = [type(node).__name__ for node in body[guards[0] + 1:]]
+        self.assertEqual(
+            after, [],
+            f"{after} is defined after `unittest.main()`, so `python3 test/test_plugin.py` runs "
+            "without it and still prints OK")
 
 
 class AuthScript(unittest.TestCase):
@@ -500,7 +538,7 @@ class AuthScript(unittest.TestCase):
         No network: an unknown command is refused on shape before anything is dialled.
         """
         done = subprocess.run(
-            ["python3", str(self.SCRIPT), "not-a-command"],
+            [sys.executable, str(self.SCRIPT), "not-a-command"],
             capture_output=True, text=True, timeout=60)
         self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
         for command in self.COMMANDS:
@@ -511,7 +549,7 @@ class AuthScript(unittest.TestCase):
         """The path is asserted and then RESOLVED, so a README naming a plausible-looking
         path into the wrong directory fails here rather than sending someone to a file
         that is not there."""
-        text = (ROOT / "README.md").read_text(encoding="utf-8")
+        text = _readme_prose(ROOT)
         quoted = "skills/memvara/scripts/memvara_auth.py"
         self.assertIn(quoted, text,
                       "the README never mentions the auth script, so the only way to "
@@ -528,7 +566,7 @@ class AuthScript(unittest.TestCase):
         Asserted positively -- the sentence must be PRESENT -- so deleting the
         explanation fails exactly as loudly as never writing it.
         """
-        text = (ROOT / "README.md").read_text(encoding="utf-8")
+        text = _readme_prose(ROOT)
         self.assertIn("cannot ship slash commands", text)
         self.assertIn("/memvara", text,
                       "the section does not name the thing the user went looking for")
@@ -540,9 +578,13 @@ class AuthScript(unittest.TestCase):
         nothing is left running -- must still be there, so a rewrite that deletes the
         sentence and explains nothing fails too.
         """
-        text = (ROOT / "README.md").read_text(encoding="utf-8")
+        text = _readme_prose(ROOT)
         self.assertNotIn("no local Python process", text,
                          "the README still claims no Python ships, and a Python script "
                          "is sitting in plugin/skills/memvara/scripts/")
         self.assertIn("Nothing runs in the background", text,
                       "the README should still tell the reader nothing is left running")
+
+
+if __name__ == "__main__":
+    unittest.main()
