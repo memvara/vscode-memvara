@@ -12,6 +12,7 @@ import pathlib
 import re
 import ssl
 import subprocess
+import sys
 import unittest
 import urllib.request
 
@@ -458,6 +459,131 @@ class Version(unittest.TestCase):
             source.count(f'"{self.VERSION}"'), 1,
             f"{self.VERSION} appears more than once in this file; VERSION is meant to be "
             "the single place the suite states the release")
+
+
+def _readme_prose(root: pathlib.Path) -> str:
+    """The README with every run of whitespace collapsed to one space.
+
+    Prose wraps, and where it wraps is not a fact about what it says. Matching the raw
+    text pinned a line break: reflowing a paragraph turned a guard red while the sentence
+    it guards was present and correct, and the cheapest way out of that is to delete the
+    guard. It matters for the negative assertion too -- a claim reintroduced with a
+    different wrap would slip past `assertNotIn` on the raw text.
+    """
+    return " ".join(root.joinpath("README.md").read_text(encoding="utf-8").split())
+
+
+class ModuleShape(unittest.TestCase):
+    """Nothing may be defined below `unittest.main()`.
+
+    Measured, not imagined: `AuthScript` was appended to the end of this file, after the
+    `__main__` block. Under `unittest discover` the module is imported, the block does not
+    run, and every test is collected. Run directly -- `python3 test/test_plugin.py`, the
+    obvious way to check one file -- `unittest.main()` executes before the class exists
+    and five guards silently do not run. Both invocations printed `OK`: 26 tests one way
+    and 21 the other, with nothing in the output saying so.
+
+    That is this repository's signature failure in miniature, so it gets a guard rather
+    than a fixed comment: a passing run must not be able to mean "the check never ran".
+    """
+
+    def test_nothing_is_defined_after_the_main_block(self) -> None:
+        import ast
+
+        source = pathlib.Path(__file__).read_text(encoding="utf-8")
+        body = ast.parse(source).body
+        guards = [i for i, node in enumerate(body)
+                  if isinstance(node, ast.If) and "__main__" in ast.dump(node.test)]
+        self.assertEqual(len(guards), 1, "expected exactly one __main__ block")
+        after = [type(node).__name__ for node in body[guards[0] + 1:]]
+        self.assertEqual(
+            after, [],
+            f"{after} is defined after `unittest.main()`, so `python3 test/test_plugin.py` runs "
+            "without it and still prints OK")
+
+
+class AuthScript(unittest.TestCase):
+    """The skill ships the device-code flow, because this host has nowhere else to put it.
+
+    A Copilot plugin's components are agents, skills, hooks, MCP servers and LSP servers.
+    Commands are not among them, so `/memvara authenticate` exists on `claude-memvara` and
+    `grok-memvara` and cannot exist here. What this host does load is the skill, and
+    skill-relative paths were measured on it before anything was built on them: a probe
+    skill whose SKILL.md held no nonce and pointed at a sibling file came back with the
+    nonce (`skill(mvprobe)` then `Read secret.md`), and came back "No mvprobe skill is
+    available to me" with the registration removed and every file still on disk.
+
+    The bytes arrive by vendoring and `SkillTree` diffs them against the library. These
+    check what vendoring cannot: that the file is here, that it RUNS, and that a person is
+    told it exists.
+    """
+
+    SCRIPT = SKILL / "scripts" / "memvara_auth.py"
+    COMMANDS = ("authenticate", "login", "logout", "stats")
+
+    def test_the_skill_ships_the_auth_script(self) -> None:
+        """Positive, because the failure to catch is a deletion: "no unexpected file in
+        the skill tree" passes on a plugin that stopped shipping the one a locked-out
+        user needs."""
+        self.assertTrue(
+            self.SCRIPT.is_file(),
+            f"{self.SCRIPT.relative_to(ROOT)} is missing; the README tells the user it "
+            "is there and the skill tells the model to run it")
+
+    def test_the_script_runs_here_and_names_every_command(self) -> None:
+        """Executed rather than read. A byte diff against the library cannot see a broken
+        script, because a library that shipped one hands every repo two copies that are
+        equally broken and agree with each other.
+
+        No network: an unknown command is refused on shape before anything is dialled.
+        """
+        done = subprocess.run(
+            [sys.executable, str(self.SCRIPT), "not-a-command"],
+            capture_output=True, text=True, timeout=60)
+        self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
+        for command in self.COMMANDS:
+            self.assertIn(command, done.stdout,
+                          f"the usage this prints omits {command}")
+
+    def test_the_readme_says_the_script_is_here_and_where(self) -> None:
+        """The path is asserted and then RESOLVED, so a README naming a plausible-looking
+        path into the wrong directory fails here rather than sending someone to a file
+        that is not there."""
+        text = _readme_prose(ROOT)
+        quoted = "skills/memvara/scripts/memvara_auth.py"
+        self.assertIn(quoted, text,
+                      "the README never mentions the auth script, so the only way to "
+                      "find it is to read the skill")
+        self.assertTrue((PLUGIN / quoted).is_file(),
+                        f"the README says {quoted}, and nothing is there")
+        self.assertIn("no `pip install`", text,
+                      "the README does not say the script needs nothing installed, "
+                      "which is the reason it can rescue a locked-out machine")
+
+    def test_the_readme_says_this_host_has_no_slash_commands(self) -> None:
+        """The reduced port, stated in the shipped artifact rather than in a plan.
+
+        Asserted positively -- the sentence must be PRESENT -- so deleting the
+        explanation fails exactly as loudly as never writing it.
+        """
+        text = _readme_prose(ROOT)
+        self.assertIn("cannot ship slash commands", text)
+        self.assertIn("/memvara", text,
+                      "the section does not name the thing the user went looking for")
+
+    def test_the_readme_no_longer_promises_no_python(self) -> None:
+        """It said "there is no local Python process", and now one ships.
+
+        Both directions: the false claim must be gone AND the true half of it -- that
+        nothing is left running -- must still be there, so a rewrite that deletes the
+        sentence and explains nothing fails too.
+        """
+        text = _readme_prose(ROOT)
+        self.assertNotIn("no local Python process", text,
+                         "the README still claims no Python ships, and a Python script "
+                         "is sitting in plugin/skills/memvara/scripts/")
+        self.assertIn("Nothing runs in the background", text,
+                      "the README should still tell the reader nothing is left running")
 
 
 if __name__ == "__main__":
