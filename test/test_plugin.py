@@ -517,6 +517,15 @@ class Hooks(unittest.TestCase):
         finally:
             sys.path.remove(str(HOOKS))
 
+        # `lib.transcript` caches the bound host in a module-level `_HOST` at IMPORT time,
+        # so `use()` above only takes effect for whichever test imports it first. Asserted
+        # rather than assumed: a future test that imports it under a different host would
+        # otherwise make this one fail with "the reader mined an empty turn", which names
+        # the reader and not the import order that actually caused it.
+        self.assertIs(transcript._HOST, record.HOST,
+                      "lib.transcript was already imported under another host, so this "
+                      "test is exercising that host's reader rather than Copilot's")
+
         raw = (EVIDENCE / "transcript.jsonl").read_bytes()
         turn, injected = transcript.last_turn_with_injections(raw)
 
@@ -560,6 +569,11 @@ class Hooks(unittest.TestCase):
             from lib import transcript  # noqa: PLC0415
         finally:
             sys.path.remove(str(HOOKS))
+
+        # See the sibling test above: the bound host is cached at import time, so this
+        # says so by name rather than failing as an empty result.
+        self.assertIs(transcript._HOST, record.HOST,
+                      "lib.transcript was already imported under another host")
 
         # Built from the library's own marker constant rather than retyped. The markers
         # contain an em dash; a hyphen typed here instead matches nothing, the filter
@@ -1099,6 +1113,20 @@ class AuthScript(unittest.TestCase):
         self.assertIn("~/.memvara/.hooks/", text,
                       "the README does not say where the hooks account for themselves, "
                       "and nothing they print reaches the screen on this host")
+        # The claim this replaces was "every one of them writes a line", and it was FALSE:
+        # approve.py has no logging call and run.py notes only failures, skips and the
+        # capture detach, so a successful auto-approve leaves no trace. The README said
+        # otherwise and this test asserted the README said it -- a claim and its guard
+        # frozen together, both wrong, which is the shape CLAUDE.md is written about.
+        # Requiring the exception to be stated is what stops it being quietly re-broadened.
+        self.assertNotIn(
+            "Every one of them writes a line", text,
+            "approve does not write a log line, so this claim is false for a quarter of "
+            "the hooks the README has just listed")
+        self.assertIn("PreToolUse` is the exception", text,
+                      "the README does not tell the reader that auto-approve is silent, "
+                      "so a matcher that has stopped matching looks exactly like one "
+                      "that is working")
 
 
 class SkillSyncWorkflow(unittest.TestCase):

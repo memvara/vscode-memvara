@@ -23,10 +23,19 @@ library, run by Copilot itself:
 | `PreToolUse` | auto-approves the read-only `memory_*` tools, so you are not asked |
 | `Stop` | mines the finished turn for anything worth keeping |
 
-Every one of them writes a line to `~/.memvara/.hooks/`, including the
-ones that decide to do nothing — "skipped" and "never ran" must not look
-alike. That directory is the account these hooks give of themselves,
-because nothing a hook prints reaches your screen on this host.
+The first, second and fourth write a line to `~/.memvara/.hooks/` every
+time they run, including when they decide to do nothing — "skipped" and
+"never ran" must not look alike. That directory is the account those
+hooks give of themselves, because nothing a hook prints reaches your
+screen on this host.
+
+**`PreToolUse` is the exception, and it is silent.** It writes nothing on
+the path where it approves, so there is no line to look for and no way to
+tell an auto-approve that worked from one that never matched. If you are
+being asked to confirm a `memory_*` tool that should have been waved
+through, the thing to check is the tool's name — Copilot spells MCP tools
+`<server>-<tool>`, so renaming the server in your own config away from
+`memvara` takes it out of the matcher's reach.
 
 `Stop` is the only one that outlives the turn: it re-runs itself detached
 so a 12–14 second extraction does not hold the session open, and that
