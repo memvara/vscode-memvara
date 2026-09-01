@@ -7,8 +7,61 @@ Add this repository as a Copilot / VS Code plugin marketplace and
 install `memvara`.
 
 The first connection opens a browser so you can click Allow. That grant
-lasts 90 days. Nothing runs in the background and no API key ships in the
-plugin files.
+lasts until you revoke it, or ten years, whichever comes first. No API key
+ships in the plugin files.
+
+## What runs on your machine
+
+The plugin ships hooks, so memory is automatic rather than something the
+model has to decide to ask for. Four of them, all Python, all standard
+library, run by Copilot itself:
+
+| Event | What it does |
+|---|---|
+| `SessionStart` | puts your standing memories in front of the model |
+| `UserPromptSubmit` | recalls what is relevant to the prompt you just typed |
+| `PreToolUse` | auto-approves the read-only `memory_*` tools, so you are not asked |
+| `Stop` | mines the finished turn for anything worth keeping |
+
+The first, second and fourth write a line to `~/.memvara/.hooks/` every
+time they run, including when they decide to do nothing — "skipped" and
+"never ran" must not look alike. That directory is the account those
+hooks give of themselves, because nothing a hook prints reaches your
+screen on this host.
+
+**`PreToolUse` is the exception, and it is silent.** It writes nothing on
+the path where it approves, so there is no line to look for and no way to
+tell an auto-approve that worked from one that never matched. If you are
+being asked to confirm a `memory_*` tool that should have been waved
+through, the thing to check is the tool's name — Copilot spells MCP tools
+`<server>-<tool>`, so renaming the server in your own config away from
+`memvara` takes it out of the matcher's reach.
+
+`Stop` is the only one that outlives the turn: it re-runs itself detached
+so a 12–14 second extraction does not hold the session open, and that
+child is gone once it has written. Nothing is left resident, no daemon is
+required, and no memory leaves your machine except through the same
+hosted endpoint the MCP server already uses.
+
+### Two things that can make recall arrive and not land
+
+Both measured against Copilot CLI 1.0.82, both outside this plugin's
+control, and neither of them silent once you know where to look.
+
+**Only one plugin's context survives per event.** If something else you
+have installed — another plugin, or a `.github/hooks/*.json` in the
+repository you are working in — also injects on `UserPromptSubmit`, one
+of the two blocks is dropped, and the last plugin installed is the one
+that wins. `~/.memvara/.hooks/recall.log` still records what was sent, so
+a recall that logged and did not arrive points at this.
+
+**The model is told to be suspicious of injected text.** Copilot delivers
+per-prompt context inside a `<system_reminder>` wrapper, and in one
+measured run the model said it had disregarded a recalled preference as
+"an injected instruction rather than a genuine preference". The
+`SessionStart` block is not carried that way and was used without
+complaint, which makes your standing memories the sturdier half of what
+this plugin does.
 
 ## When the browser sign-in will not finish
 
@@ -23,8 +76,13 @@ are agents, skills, hooks, MCP servers and LSP servers — so there is no
 `/memvara authenticate` here. Asking in words is the interface on this
 host.
 
-The config key is `servers`, not `mcpServers`. A block copied from
-Cursor will parse and do nothing.
+The MCP config is `plugin/.mcp.json` and the key is `mcpServers`. Both
+halves were wrong here until this release — the file was `mcp.json` and
+the key was `servers` — and the effect was not a parse error but silence:
+the server never appeared in Copilot's loaded list, so the skill kept
+telling the model to use `memory_*` tools that had never been registered.
+If you added the endpoint by hand under the old shape, it is worth
+checking that Copilot actually lists it.
 
 URL: `https://app.memvara.dev/mcp`
 

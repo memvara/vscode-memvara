@@ -1,5 +1,5 @@
 {
-  "servers": {
+  "mcpServers": {
     "memvara": {
       "type": "http",
       "url": "https://app.memvara.dev/mcp"

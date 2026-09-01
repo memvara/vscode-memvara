@@ -1,0 +1,15 @@
+{
+  "_comment": "What GitHub Copilot CLI was SEEN to fire, not what its documentation names. Documentation says what an event is called; a receipt says what actually ran, and only both together close the gap that makes a wrong event name silent. Captured 2026-09-01 from one session that submitted a prompt, ran a tool and ended, with a probe plugin installed the way a user installs one. The client's version is under `client_version`, not `version`: the version guard in test_plugin.py scans every JSON file in this repository for a `version` key, and this is not one of this plugin's manifests.",
+  "client": "GitHub Copilot CLI",
+  "client_version": "1.0.82",
+  "measured": "2026-09-01",
+  "events_fired": [
+    "SessionStart",
+    "UserPromptSubmit",
+    "PreToolUse",
+    "PostToolUse",
+    "Stop",
+    "SessionEnd"
+  ],
+  "note_on_casing": "Each of these also fires under its camelCase name (sessionStart, userPromptSubmitted, preToolUse, postToolUse, agentStop, sessionEnd), and the casing decides the PAYLOAD field names: PascalCase delivers session_id/tool_name/transcript_path, camelCase delivers sessionId/toolName/transcriptPath. This plugin registers PascalCase, so its field map is Claude Code's."
+}
