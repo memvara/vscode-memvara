@@ -492,6 +492,90 @@ class Hooks(unittest.TestCase):
                          "`-p` must be last: lib/extract.py appends the prompt as the "
                          "final argument and `-p` takes it as its value")
 
+    def test_the_transcript_reader_mines_a_real_session_from_this_client(self) -> None:
+        """The code half of this port, against a transcript captured FROM the client.
+
+        Copilot's session log is a third shape -- `{"type": "user.message", "data": {...}}`
+        -- so `lib/transcript.py` carries a reader for it. Read with the Claude reader
+        every line formats to `[]`, and the symptom is not an error: capture runs on every
+        turn, mines an empty string, and logs `no turn to mine` forever while every other
+        gate here stays green. That is the failure this fixture exists to catch, and only
+        a real transcript catches it -- a hand-written one would be written from the same
+        assumption the reader is.
+
+        The fixture is one real session that typed a prompt, created a file, read it back
+        and edited it, with a recall block injected into it. Every assertion below is a
+        different way this reader has already been got wrong on some host in this family.
+        """
+        sys.path.insert(0, str(HOOKS))
+        try:
+            from core import host as bind  # noqa: PLC0415
+            import hosts.copilot as record  # noqa: PLC0415
+
+            bind.use(record.HOST)
+            from lib import transcript  # noqa: PLC0415
+        finally:
+            sys.path.remove(str(HOOKS))
+
+        raw = (EVIDENCE / "transcript.jsonl").read_bytes()
+        turn, injected = transcript.last_turn_with_injections(raw)
+
+        self.assertTrue(turn, "the reader mined an empty turn from a real session")
+        self.assertIn("User: ", turn,
+                      "no typed prompt was recovered, so capture has no turn boundary")
+        self.assertIn("Claude used create", turn,
+                      "what the turn DID is missing -- a fact grounded in the action "
+                      "rather than stated in the reply would be lost on this host alone")
+        self.assertIn("Claude used edit", turn)
+        self.assertNotIn(
+            "Claude used view", turn,
+            "`view` is a read and is excluded exactly as Claude Code's `Read` is; "
+            "including it puts every file the agent opened into the turn as if it "
+            "were work")
+        self.assertTrue(
+            injected,
+            "the echo filter saw nothing, so a memory the model was SHOWN and then "
+            "restated would be mined back in and stored again -- every session, with a "
+            "successful receipt each time")
+
+    def test_the_echo_filter_sees_the_standing_block_and_not_only_the_prompt(self) -> None:
+        """The narrower half of the guard above, because it was got wrong here first.
+
+        The reader originally took injections from the transformed prompt alone. Copilot's
+        `SessionStart` block never enters the transcript as a message at all, so standing
+        memories were unprotected: the model restates one it was shown at session start,
+        capture mines the reply, the filter has nothing to match, and the fact is written
+        again. Copilot records every hook's own output as a `hook.end` entry, which covers
+        BOTH events, and that is what the filter reads now.
+
+        Asserted through the `hook.end` entry specifically, so that if a later client stops
+        logging hook output this goes red rather than quietly losing half its coverage.
+        """
+        sys.path.insert(0, str(HOOKS))
+        try:
+            from core import host as bind  # noqa: PLC0415
+            import hosts.copilot as record  # noqa: PLC0415
+
+            bind.use(record.HOST)
+            from lib import transcript  # noqa: PLC0415
+        finally:
+            sys.path.remove(str(HOOKS))
+
+        # Built from the library's own marker constant rather than retyped. The markers
+        # contain an em dash; a hyphen typed here instead matches nothing, the filter
+        # returns empty, and the test fails for a reason that has nothing to do with the
+        # behaviour under test. Reading the constant also means a marker changed upstream
+        # cannot leave this guard passing against a string nothing writes any more.
+        marker = next(m for m in transcript.RECALL_MARKERS if "already known" in m)
+        entry = {"type": "hook.end",
+                 "data": {"hookType": "sessionStart", "success": True,
+                          "output": {"additionalContext":
+                                     f"{marker}:\n- user prefers the samply profiler"}}}
+        self.assertEqual(transcript._entry_injected(entry),
+                         ["user prefers the samply profiler"],
+                         "a standing block logged by the client is invisible to the echo "
+                         "filter, so the model restating it re-stores it as a new fact")
+
     def test_a_hook_never_fails_a_turn_whatever_the_environment(self) -> None:
         """No home directory, no store, no credentials: exit 0 and stay quiet."""
         env = dict(os.environ, HOME="/nonexistent", MEMVARA_HOME="/nonexistent",
