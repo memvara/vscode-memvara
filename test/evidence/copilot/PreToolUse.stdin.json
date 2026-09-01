@@ -1,0 +1,11 @@
+{
+  "cwd": "/tmp/example",
+  "hook_event_name": "PreToolUse",
+  "session_id": "00000000-0000-0000-0000-000000000000",
+  "timestamp": "2026-09-01T07:42:02.245Z",
+  "tool_input": {
+    "command": "echo hello-from-copilot",
+    "description": "Echo test string"
+  },
+  "tool_name": "Bash"
+}

@@ -1,0 +1,8 @@
+{
+  "cwd": "/tmp/example",
+  "hook_event_name": "SessionStart",
+  "initial_prompt": "Run the shell command: echo hello-from-copilot. Then tell me what it printed.",
+  "session_id": "00000000-0000-0000-0000-000000000000",
+  "source": "new",
+  "timestamp": "2026-09-01T07:41:58.920Z"
+}

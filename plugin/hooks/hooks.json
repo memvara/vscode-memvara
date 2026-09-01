@@ -1,0 +1,50 @@
+{
+  "description": "Memvara for GitHub Copilot CLI: the standing block at session start, recall on every prompt, auto-approve on tool use, and capture when a turn ends. Capture is declared SYNCHRONOUS on purpose -- an async hook holds the turn open on this client rather than being deferred -- and run.py forks it with its pipes closed, which is what actually releases the turn here. Nothing this plugin prints reaches the screen, so its account is ~/.memvara/.hooks/.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT:-${COPILOT_PLUGIN_ROOT}}/hooks/run.py\" session_start --host copilot",
+            "timeout": 20
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT:-${COPILOT_PLUGIN_ROOT}}/hooks/run.py\" recall --host copilot",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT:-${COPILOT_PLUGIN_ROOT}}/hooks/run.py\" capture --host copilot",
+            "timeout": 120
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": ".*memvara.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT:-${COPILOT_PLUGIN_ROOT}}/hooks/run.py\" approve --host copilot",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -21,9 +21,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Read skill.lock
+      - name: Read skill.lock and hooks.lock
         id: lock
-        run: echo "sha=$(awk -F= '/^sha=/{print $2}' skill.lock)" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "sha=$(awk -F= '/^sha=/{print $2}' skill.lock)" >> "$GITHUB_OUTPUT"
+          echo "hooks=$(awk -F= '/^sha=/{print $2}' hooks.lock)" >> "$GITHUB_OUTPUT"
 
       - uses: actions/checkout@v7
         with:
@@ -46,6 +48,22 @@ jobs:
       # One shallow ref, no token, no API. `--depth 1` because only the tip's tree is read.
       - name: Fetch the library's default branch, so the drift check cannot skip
         run: git -C _library fetch --depth 1 origin main:refs/remotes/origin/main
+
+      # The checkout above is pinned to skill.lock's sha. The hook guards compare against
+      # hooks.lock's, which is a different commit and is not an object in that shallow
+      # clone -- so without this they fall through to the unauthenticated GitHub API,
+      # capped at 60/hour against an IP the runners share, and SKIP rather than check.
+      # Reproduced in this family: "vendored bytes NOT checked: HTTP Error 403: rate limit
+      # exceeded". It does not skip every run, which is the argument FOR this step rather
+      # than against it -- a guard that checks most of the time is one whose green cannot
+      # be read as "checked", and this is the guard that proves the vendored bytes are the
+      # library's.
+      #
+      # Soft on purpose: fetching a sha unreachable from any remote ref fails, and that
+      # would turn a guard which skips with a printed reason into a red job and a git
+      # error naming neither hooks nor drift. This step is an optimisation, not a check.
+      - name: Fetch the library commit hooks.lock pins, so the hook guards cannot skip
+        run: git -C _library fetch --depth 1 origin ${{ steps.lock.outputs.hooks }} || true
 
       - uses: actions/setup-python@v7
         with:

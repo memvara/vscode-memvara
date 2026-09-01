@@ -122,15 +122,394 @@ def _library_skill_files(sha: str) -> "set[str]":
             if entry.get("type") == "blob" and entry["path"].startswith(prefix)}
 
 
-def _lock() -> dict[str, str]:
+def _library_files(sha: str, path: str) -> "set[str]":
+    """Every path under `path` at `sha`, relative to `path`. The hook twin of
+    `_library_skill_files`, which hardcodes the packaged-skill prefix."""
+    root = os.environ.get("MEMVARA_LIBRARY")
+    prefix = f"{path}/"
+    if root:
+        try:
+            out = subprocess.check_output(
+                ["git", "-C", root, "ls-tree", "-r", "--name-only", sha, path],
+                stderr=subprocess.DEVNULL).decode()
+        except subprocess.CalledProcessError:
+            out = None
+        if out is not None:
+            return {line[len(prefix):] for line in out.splitlines()
+                    if line.startswith(prefix)}
+    try:
+        tree = json.loads(_fetch(
+            f"https://api.github.com/repos/memvara/memvara/git/trees/{sha}?recursive=1"))
+    except Exception as exc:
+        raise LibraryUnreachable(str(exc)) from exc
+    return {entry["path"][len(prefix):] for entry in tree.get("tree", [])
+            if entry.get("type") == "blob" and entry["path"].startswith(prefix)}
+
+
+def _lock(name: str = "skill.lock") -> dict[str, str]:
     out: dict[str, str] = {}
-    for line in (ROOT / "skill.lock").read_text(encoding="utf-8").splitlines():
+    for line in (ROOT / name).read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
         key, _, value = line.partition("=")
         out[key.strip()] = value.strip()
     return out
+
+
+#: The vendored hook tree, the library path it comes from, and the one file in it that is
+#: NOT vendored: `hooks.json` is generated from `hosts/copilot.py` and has its own guard.
+HOOKS = PLUGIN / "hooks"
+LIBRARY_HOOKS_PATH = "plugin/hooks"
+GENERATED_REGISTRATION = "hooks.json"
+EVIDENCE = ROOT / "test" / "evidence" / "copilot"
+
+#: Hook scripts are executable content Copilot runs on every prompt, so the allowlist
+#: names them one by one. A file under `hooks/` that nobody listed is the thing to catch.
+ALLOWED_HOOK_FILES = {
+    "hooks.json",
+    "run.py", "recall.py", "capture.py", "session_start.py", "approve.py", "daemon.py",
+    "core/__init__.py", "core/host.py", "core/envelope.py",
+    # `hosts/claude.py`, `hosts/codex.py`, `hosts/cursor.py` and `hosts/opencode.py` are
+    # other clients' records: inert here, since `run.py --host copilot` imports only the
+    # record it is given. Present because the tree is copied whole with zero transforms,
+    # and named rather than wildcarded so a file nobody read cannot ship from this plugin.
+    "hosts/__init__.py", "hosts/claude.py", "hosts/codex.py", "hosts/copilot.py",
+    "hosts/cursor.py", "hosts/opencode.py",
+    "js/shim.mjs", "js/opencode.mjs",
+    "lib/__init__.py", "lib/extract.py", "lib/fast.py", "lib/hosted.py", "lib/ipc.py",
+    "lib/open.py", "lib/standing.py", "lib/transcript.py", "lib/usage.py", "lib/write.py",
+    "tools/__init__.py", "tools/generate.py",
+}
+
+
+class Hooks(unittest.TestCase):
+    """The tree Copilot runs on every prompt, vendored byte for byte with ZERO transforms.
+
+    Stricter than `skill.lock`, which sanctions exactly one line. Two comparisons because
+    they catch different failures: against the sha the lock names, and against the
+    library's current default branch. The first alone is satisfied forever by a lock and a
+    copy frozen together, which is how the vendored skill in this family once shipped five
+    commits behind for four days with every test green.
+    """
+
+    def _ours(self) -> "set[str]":
+        return {path.relative_to(HOOKS).as_posix() for path in HOOKS.rglob("*")
+                if path.is_file() and "__pycache__" not in path.parts}
+
+    def _vendored(self) -> "set[str]":
+        # `hooks.json` is generated from the host record, not vendored: seven repositories
+        # share this tree and each registers a different client, so a canonical copy would
+        # be one repository's manifest shipped to all of them.
+        return self._ours() - {GENERATED_REGISTRATION}
+
+    def _record(self):
+        sys.path.insert(0, str(HOOKS))
+        try:
+            import hosts.copilot as record  # noqa: PLC0415
+
+            return record.HOST
+        finally:
+            sys.path.remove(str(HOOKS))
+
+    def test_the_vendored_hook_bytes_match_the_library_at_the_pinned_sha(self) -> None:
+        lock = _lock("hooks.lock")
+        self.assertEqual(lock["repo"], "memvara/memvara")
+        self.assertEqual(lock["path"], LIBRARY_HOOKS_PATH)
+        self.assertEqual(lock["host"], "copilot")
+        sha = lock["sha"]
+        self.assertEqual(len(sha), 40, f"hooks.lock sha is not a full sha: {sha!r}")
+        ours = self._vendored()
+        self.assertTrue(ours, "no vendored hook files found - this guard would pass on "
+                              "an empty tree, which is the shape it exists to stop")
+        try:
+            upstream = _library_files(sha, LIBRARY_HOOKS_PATH)
+        except LibraryUnreachable as exc:
+            raise unittest.SkipTest(
+                f"library unreachable, vendored bytes NOT checked: {exc}") from exc
+        self.assertEqual(ours, upstream,
+                         f"the vendored hook file set differs from the library@{sha[:7]}")
+        drifted = [rel for rel in sorted(ours)
+                   if (HOOKS / rel).read_bytes()
+                   != _library_bytes(sha, f"{LIBRARY_HOOKS_PATH}/{rel}")]
+        self.assertEqual(drifted, [], f"vendored hooks drifted from {sha[:7]}: {drifted}")
+
+    def test_the_vendored_hooks_are_not_behind_the_library(self) -> None:
+        """Skips loudly rather than passing when the library cannot be reached: a check
+        that passes because it could not look is the failure one level up."""
+        try:
+            head = _library_head()
+            upstream = _library_files(head, LIBRARY_HOOKS_PATH)
+        except LibraryUnreachable as exc:
+            raise unittest.SkipTest(
+                f"library unreachable, hook drift NOT checked: {exc}") from exc
+        self.assertTrue(upstream, "the library reported an empty hook tree")
+        self.assertEqual(self._vendored(), upstream,
+                         f"the vendored hook file set differs from the library at "
+                         f"{head[:7]} - re-vendor and update hooks.lock")
+
+    def test_the_hook_file_set_is_named_here_one_by_one(self) -> None:
+        extra = self._ours() - ALLOWED_HOOK_FILES
+        self.assertFalse(extra, f"unlisted hook files: {sorted(extra)} - add them to "
+                                "ALLOWED_HOOK_FILES deliberately, having read them")
+
+    def test_the_allowlist_names_nothing_that_is_no_longer_in_the_tree(self) -> None:
+        """A file deleted upstream leaves its entry behind, the entry covers nothing, and
+        a list that has stopped covering a file looks exactly like one that covers
+        everything."""
+        missing = ALLOWED_HOOK_FILES - self._ours()
+        self.assertFalse(missing, f"allowlist names files that are gone: {sorted(missing)}")
+
+    def test_the_registration_sits_where_this_client_actually_looks(self) -> None:
+        """The one guard without which this whole port silently does nothing.
+
+        Copilot recognises a plugin manifest at `.plugin/plugin.json`, `plugin.json`,
+        `.github/plugin/plugin.json` or `.claude-plugin/plugin.json` - the installer
+        prints exactly that list when it cannot find one. This plugin's manifest is at
+        `plugin/.github/plugin.json`, which is on no such list, so it is NOT READ: measured
+        on 1.0.82, a `hooks` key there produced no receipt and a `skills` key naming a
+        non-default directory left the skill unlisted.
+
+        So the registration is found by CONVENTION, which means `hooks.json` at the plugin
+        root. Move it, or add a `hooks` key to a manifest the client would read, and the
+        hooks stop firing while every other test here stays green.
+        """
+        self.assertTrue((HOOKS / "hooks.json").is_file(),
+                        "hooks.json is not at plugin/hooks/hooks.json")
+        manifest = _json(PLUGIN / ".github" / "plugin.json")
+        self.assertNotIn(
+            "hooks", manifest,
+            "the manifest declares a hooks key, and at this path the client never reads "
+            "it - and if the manifest is ever moved to a path it DOES read, that key "
+            "replaces the convention rather than adding to it, so the two must be "
+            "decided together")
+
+    def test_every_hook_this_plugin_declares_points_at_a_file_that_exists(self) -> None:
+        """Replaces the old `test_no_hooks`, which asserted `plugin/hooks` did not exist.
+
+        That was a guard a deletion satisfies. This one is positive: the command set must
+        be NON-EMPTY, every entry must be a command, and every path it names must resolve
+        once the plugin-root variable is expanded - so a gutted `{"hooks": {}}` fails
+        exactly as loudly as a broken path.
+        """
+        body = _json(HOOKS / "hooks.json")["hooks"]
+        self.assertTrue(body, "hooks.json registers no events at all")
+        seen = 0
+        for event, entries in body.items():
+            for entry in entries:
+                for command in entry["hooks"]:
+                    self.assertEqual(command["type"], "command", event)
+                    text = command["command"]
+                    self.assertIn("run.py", text, event)
+                    # `${PLUGIN_ROOT:-${COPILOT_PLUGIN_ROOT}}` -> the tree on disk here.
+                    # Everything after the LAST closing brace: the expansion is nested,
+                    # so a non-greedy `\$\{[^}]*\}` stops at the inner `}` and leaves a
+                    # stray one on the front of the path.
+                    quoted = text.split('"')[1]
+                    rel = quoted[quoted.rindex("}") + 1:].lstrip("/")
+                    self.assertTrue((PLUGIN / rel).is_file(),
+                                    f"{event} names {rel}, which is not a file here")
+                    seen += 1
+        self.assertGreaterEqual(seen, 4, "fewer commands registered than hooks shipped")
+
+    def test_the_events_registered_are_the_ones_this_host_was_seen_to_fire(self) -> None:
+        """Set membership against a receipt, not against documentation.
+
+        Documentation says what an event is CALLED. `verified.json` records what actually
+        fired, captured from the client by a probe installed the way a user installs one.
+        Only both together close the gap that makes a wrong event name completely silent.
+        """
+        fired = set(_json(EVIDENCE / "verified.json")["events_fired"])
+        registered = set(_json(HOOKS / "hooks.json")["hooks"])
+        self.assertTrue(registered, "hooks.json registers no events")
+        self.assertLessEqual(
+            registered, fired,
+            f"registered but never seen to fire: {sorted(registered - fired)} - an event "
+            "name this client does not fire is a hook that installs and never runs")
+
+    def test_the_event_payload_this_host_sends_is_the_one_the_hook_reads(self) -> None:
+        """Compares the hook against payloads captured FROM the client, not against our
+        assumption about it.
+
+        A renamed stdin key is silent here: the dedup file is keyed on session, so a miss
+        re-injects every memory on every turn while looking perfectly healthy. The casing
+        is the live hazard - Copilot fires `userPromptSubmitted` as readily as
+        `UserPromptSubmit` and sends `sessionId` instead of `session_id` when it does, so
+        a registration that drifted to camelCase would read nothing at all.
+        """
+        sys.path.insert(0, str(HOOKS))
+        try:
+            from core import envelope  # noqa: PLC0415
+            import hosts.copilot as record  # noqa: PLC0415
+        finally:
+            sys.path.remove(str(HOOKS))
+        host = record.HOST
+        for event, hook, wanted in (
+                ("SessionStart", "session_start", ("session", "cwd")),
+                ("UserPromptSubmit", "recall", ("session", "cwd", "prompt")),
+                ("PreToolUse", "approve", ("session", "tool_name")),
+                ("Stop", "capture", ("session", "cwd", "transcript_path"))):
+            with self.subTest(event=event):
+                raw = (EVIDENCE / f"{event}.stdin.json").read_bytes()
+                ev = envelope.read_event(host, hook, raw)
+                for field in wanted:
+                    self.assertTrue(getattr(ev, field),
+                                    f"{event} carries {field} and the record does not "
+                                    f"read it")
+
+    def test_the_reply_is_flat_because_the_nested_shape_delivers_nothing_here(self) -> None:
+        """The measurement that decides whether recall reaches the model at all.
+
+        Isolated on 1.0.82 by emitting each shape alone: `hookSpecificOutput.
+        additionalContext` returned `NO CANARY`, a top-level `additionalContext` was read
+        back verbatim. Shipping Claude Code's envelope unchanged produces a plugin that
+        installs, runs, logs success and recalls nothing.
+        """
+        sys.path.insert(0, str(HOOKS))
+        try:
+            from core import envelope  # noqa: PLC0415
+            from core.host import Reply  # noqa: PLC0415
+            import hosts.copilot as record  # noqa: PLC0415
+        finally:
+            sys.path.remove(str(HOOKS))
+        rendered = json.loads(envelope.render(
+            record.HOST, Reply("recall", context="a memory")))
+        self.assertEqual(rendered, {"additionalContext": "a memory"},
+                         "the reply is not the flat shape this client reads")
+        self.assertNotIn("hookSpecificOutput", rendered)
+
+    def test_the_approve_matcher_matches_the_way_this_client_anchors_it(self) -> None:
+        """Copilot compiles a matcher as `^(?:PATTERN)$` and names MCP tools
+        `<server>-<tool>` - measured against a local stdio server, where `memory_recall`
+        from a server configured as `memvara` reached the hook as `memvara-memory_recall`.
+
+        Both halves matter and neither is Claude Code's. An unanchored `memvara`, which is
+        exactly what the sibling Cursor record uses, matches NOTHING here; and a separator
+        of `__` leaves the leaf as the whole string, so `_tool_leaf` never finds a
+        read-only tool name and nothing is ever auto-approved.
+        """
+        host = self._record()
+        name = "memvara-memory_recall"
+        self.assertTrue(re.fullmatch(host.approve.matcher, name),
+                        f"{host.approve.matcher!r} does not match {name!r} when anchored "
+                        "the way this client anchors it")
+        leaf = name
+        for sep in host.approve.separators:
+            if sep in leaf:
+                leaf = leaf.rsplit(sep, 1)[-1]
+                break
+        self.assertEqual(leaf, "memory_recall",
+                         "the separators do not reduce this client's tool name to the "
+                         "bare tool, so approve.py can never recognise a read-only one")
+
+    def test_capture_is_not_registered_async_on_this_client(self) -> None:
+        """`async: true` is accepted here and is NOT honoured: measured, a hook declared
+        async that slept six seconds delayed the client's exit by six seconds. Capture is
+        declared synchronous and `run.py` forks it with its pipes closed, which is what
+        actually releases the turn. An `async` key reappearing here would be decoration
+        over a turn that still hangs for the whole extraction.
+        """
+        stop = _json(HOOKS / "hooks.json")["hooks"]["Stop"][0]["hooks"][0]
+        self.assertNotIn("async", stop,
+                         "Stop is registered async, and this client does not honour the "
+                         "flag - the turn would still wait for the whole extraction")
+
+    def test_no_context_limit_is_declared_because_this_client_imposes_none(self) -> None:
+        """The opposite of the Codex guard, and measured rather than inherited.
+
+        Codex truncates `additionalContext` middle-out above a default and needs its limit
+        raised. Copilot passed a 16,384-byte block whole - head, middle and tail nonces all
+        arrived - so there is nothing to raise. `additionalContextLimit` is Codex's key;
+        emitting it here would address a setting this client has no use for, and a key
+        nobody reads is a key that goes stale unnoticed.
+        """
+        for entries in _json(HOOKS / "hooks.json")["hooks"].values():
+            for entry in entries:
+                for command in entry["hooks"]:
+                    self.assertNotIn("additionalContextLimit", command)
+
+    def test_this_repository_ships_the_record_its_lock_binds(self) -> None:
+        self.assertEqual(_lock("hooks.lock")["host"], "copilot")
+        self.assertTrue((HOOKS / "hosts" / "copilot.py").is_file())
+
+    def test_the_registration_is_what_the_record_generates(self) -> None:
+        """`hooks.json` is the one file here that is built rather than copied.
+
+        Built IN PROCESS and compared to the committed bytes. A sibling repository's first
+        version of this guard ran `generate.py` as a subprocess, which REWRITES hooks.json,
+        and then diffed the file against git - so the regeneration erased the edit before
+        the comparison and a hand-edited manifest passed. It could not fail, which a
+        sabotage found and reading could not.
+        """
+        sys.path.insert(0, str(HOOKS))
+        try:
+            from tools.generate import registration  # noqa: PLC0415
+            import hosts.copilot as record  # noqa: PLC0415
+        finally:
+            sys.path.remove(str(HOOKS))
+        self.assertEqual(
+            (HOOKS / "hooks.json").read_bytes(), registration(record.HOST),
+            "the committed hooks.json is not what hosts/copilot.py generates - it was "
+            "hand-edited, or the record changed without regenerating")
+
+    def test_capture_mines_with_this_host_s_own_model(self) -> None:
+        """The README promises "your own model", so the first rung must be this host's CLI.
+
+        The absence of `--model` is the subtler half: naming one there overrides the model
+        this user configured and authenticated, from inside a hook they never read, and
+        could name one their account cannot reach.
+        """
+        argv = self._record().extractor.argv
+        self.assertEqual(
+            argv[0], "copilot",
+            f"the first rung of the extractor chain is {argv[0]!r}, not this host's own "
+            "CLI, so the README's promise that capture uses your own model is false")
+        self.assertNotIn(
+            "--model", argv,
+            "the extractor pins a model, which overrides the one this user configured "
+            "and may name one their account cannot reach")
+
+    def test_the_extractor_cannot_run_tools_with_the_text_it_is_handed(self) -> None:
+        """`copilot -p` executes tools WITHOUT `--allow-all-tools` - measured, a probe told
+        to run a shell command ran it. What the extractor is handed is a mined turn:
+        arbitrary text, including anything the user pasted into their session. So the argv
+        must grant no tools, and this asserts the guard is still on it.
+
+        Stated positively, against the mechanism measured to work. `--available-tools=`
+        with an empty value did NOT restrict, `--excluded-tools=bash` left
+        `read_bash`/`list_bash` behind, and `--deny-tool=shell` did not stop `bash`; an
+        allowlist naming a tool that does not exist is the one form that granted nothing.
+        """
+        argv = self._record().extractor.argv
+        allow = [a for a in argv if a.startswith("--available-tools")]
+        self.assertEqual(len(allow), 1,
+                         "the extractor argv does not restrict the tools available to "
+                         "the model it hands mined turn text to")
+        self.assertNotEqual(allow[0], "--available-tools=",
+                            "an empty allowlist does not restrict on this client - "
+                            "measured, the probe still ran bash")
+        self.assertEqual(argv[-1], "-p",
+                         "`-p` must be last: lib/extract.py appends the prompt as the "
+                         "final argument and `-p` takes it as its value")
+
+    def test_a_hook_never_fails_a_turn_whatever_the_environment(self) -> None:
+        """No home directory, no store, no credentials: exit 0 and stay quiet."""
+        env = dict(os.environ, HOME="/nonexistent", MEMVARA_HOME="/nonexistent",
+                   # WITHOUT this, `capture` on this host forks and returns before the
+                   # body is even imported -- `detach_capture=True` -- so the subtest
+                   # would check the exit code of the forking wrapper while the code that
+                   # opens a store, reads a transcript and writes claims ran unobserved
+                   # in a detached child whose stdout goes to /dev/null.
+                   MEMVARA_HOOK_DETACHED="1")
+        for hook in ("session_start", "recall", "capture", "approve"):
+            with self.subTest(hook=hook):
+                proc = subprocess.run(
+                    [sys.executable, str(HOOKS / "run.py"), hook, "--host", "copilot"],
+                    input="{}", capture_output=True, text=True, env=env, timeout=120)
+                self.assertEqual(proc.returncode, 0,
+                                 f"{hook} exited {proc.returncode}: {proc.stderr[:300]}")
+                if proc.stdout.strip():
+                    json.loads(proc.stdout)
 
 
 class SkillTree(unittest.TestCase):
@@ -287,8 +666,9 @@ class Hygiene(unittest.TestCase):
                 continue
             self.assertNotIn("npx", path.read_text(encoding="utf-8"), path)
 
-    def test_no_hooks(self) -> None:
-        self.assertFalse((PLUGIN / "hooks").exists())
+    def test_no_app_manifest_and_no_commands(self) -> None:
+        """`plugin/hooks` used to be asserted ABSENT here. It ships now, and its guards
+        are the `Hooks` class above -- stated positively, so a deletion fails them."""
         self.assertFalse((PLUGIN / ".app.json").exists())
         self.assertFalse((PLUGIN / "commands").exists())
 
@@ -307,18 +687,44 @@ class VscodeManifest(unittest.TestCase):
         body = _json(ROOT / ".github" / "plugin" / "marketplace.json")
         self.assertEqual(body["plugins"][0]["source"], "./plugin")
 
-    def test_mcp_uses_servers_not_mcpServers(self) -> None:
-        body = _json(PLUGIN / "mcp.json")
-        self.assertIn("servers", body)
-        self.assertNotIn("mcpServers", body)
-        server = body["servers"]["memvara"]
+    def test_the_mcp_config_is_where_this_client_looks_and_shaped_the_way_it_reads(self) -> None:
+        """This replaces `test_mcp_uses_servers_not_mcpServers`, which asserted the exact
+        opposite and was green the whole time the server never loaded.
+
+        That guard read the file this repository ships and checked it against a claim this
+        repository also made. Both agreed, both were wrong, and nothing compared either to
+        the client -- the defect shape CLAUDE.md describes at length. Measured on Copilot
+        CLI 1.0.82 with four plugins installed side by side and one session listing what
+        loaded:
+
+        * `.mcp.json` with an `mcpServers` key -- LOADED
+        * `.github/mcp.json` with an `mcpServers` key -- LOADED
+        * `.mcp.json` with a `servers` key -- not loaded
+        * `mcp.json` with a `servers` key, which is what shipped -- not loaded
+
+        So the plugin advertised a skill telling the model to use `memory_*` tools that
+        were never registered on this host. Both halves of the fix are asserted, because
+        either one alone still leaves the server absent.
+        """
+        self.assertFalse((PLUGIN / "mcp.json").exists(),
+                         "plugin/mcp.json is not a path this client reads; the config "
+                         "must be .mcp.json")
+        body = _json(PLUGIN / ".mcp.json")
+        self.assertIn("mcpServers", body,
+                      "a `servers` key is not read by this client -- measured, the server "
+                      "simply does not appear in session.mcp_servers_loaded")
+        self.assertNotIn("servers", body)
+        server = body["mcpServers"]["memvara"]
         self.assertEqual(server["url"], HOSTED)
         self.assertEqual(server["type"], "http")
         self.assertNotIn("command", server)
 
     def test_readme(self) -> None:
         text = (ROOT / "README.md").read_text(encoding="utf-8")
-        self.assertIn("servers", text)
+        # `mcpServers`, spelled out: the old assertion was on the substring "servers",
+        # which the wrong key satisfied too and so could never have caught the config
+        # this repository actually shipped.
+        self.assertIn("mcpServers", text)
         self.assertIn(HOSTED, text)
         self.assertNotIn("npx ", text)
         self.assertNotIn("chatgpt", text.lower())
@@ -326,12 +732,22 @@ class VscodeManifest(unittest.TestCase):
     def test_plugin_tree(self) -> None:
         allowed = {
             pathlib.Path(".github") / "plugin.json",
-            pathlib.Path("mcp.json"),
+            pathlib.Path(".mcp.json"),
         }
         for path in SKILL.rglob("*"):
             if path.is_file():
                 allowed.add(path.relative_to(PLUGIN))
-        found = {p.relative_to(PLUGIN) for p in PLUGIN.rglob("*") if p.is_file()}
+        # The hook tree is allowlisted file by file in `ALLOWED_HOOK_FILES`, which the
+        # `Hooks` class checks in both directions. Widening it here to `hooks/**` would
+        # make that list decorative.
+        for rel in ALLOWED_HOOK_FILES:
+            allowed.add(pathlib.Path("hooks") / rel)
+        # `__pycache__` is gitignored and never shipped, but `rglob` sees it the moment
+        # anything here imports the hook tree -- and this suite does, twice. Filtered the
+        # same way `Hooks._ours()` filters it, rather than left to make the run's outcome
+        # depend on whether the tests had been run before.
+        found = {p.relative_to(PLUGIN) for p in PLUGIN.rglob("*")
+                 if p.is_file() and "__pycache__" not in p.parts}
         self.assertFalse(found - allowed, found - allowed)
 
 
@@ -571,19 +987,34 @@ class AuthScript(unittest.TestCase):
         self.assertIn("/memvara", text,
                       "the section does not name the thing the user went looking for")
 
-    def test_the_readme_no_longer_promises_no_python(self) -> None:
-        """It said "there is no local Python process", and now one ships.
+    def test_the_readme_says_what_now_runs_on_the_user_s_machine(self) -> None:
+        """This replaces a guard that had gone false while staying green.
 
-        Both directions: the false claim must be gone AND the true half of it -- that
-        nothing is left running -- must still be there, so a rewrite that deletes the
-        sentence and explains nothing fails too.
+        It asserted the README still said "Nothing runs in the background". That was true
+        when the plugin was a skill and an MCP block. It stopped being true the moment
+        hooks shipped -- `Stop` re-execs itself detached and outlives the turn -- and the
+        test would have HELD THE SENTENCE IN PLACE, which is the shape this repository's
+        CLAUDE.md warns about: a claim and its guard frozen together, agreeing with each
+        other while both are wrong.
+
+        Stated positively, so a rewrite that deletes the section fails as loudly as one
+        that lies: the README must name the events, and must say where the hooks account
+        for themselves, because a user who cannot see a hook working has nowhere to look
+        when it breaks.
         """
         text = _readme_prose(ROOT)
         self.assertNotIn("no local Python process", text,
-                         "the README still claims no Python ships, and a Python script "
-                         "is sitting in plugin/skills/memvara/scripts/")
-        self.assertIn("Nothing runs in the background", text,
-                      "the README should still tell the reader nothing is left running")
+                         "the README still claims no Python ships, and four hooks do")
+        self.assertNotIn(
+            "Nothing runs in the background", text,
+            "the README still promises nothing runs in the background, and capture now "
+            "forks a child that outlives the turn")
+        for event in ("SessionStart", "UserPromptSubmit", "PreToolUse", "Stop"):
+            self.assertIn(event, text,
+                          f"the README does not tell the reader that {event} runs")
+        self.assertIn("~/.memvara/.hooks/", text,
+                      "the README does not say where the hooks account for themselves, "
+                      "and nothing they print reaches the screen on this host")
 
 
 class SkillSyncWorkflow(unittest.TestCase):
