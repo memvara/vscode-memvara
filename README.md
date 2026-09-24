@@ -55,7 +55,7 @@ exact commit. Besides the logs, they keep two kinds of small file in
   is no remote. On the hosted server the hooks send it with every call, in a
   `Memvara-Project` header, so that memories are kept per repository.
 - `counts/` holds one file per session with three numbers: the memory lines
-  the hooks put in front of the model, the read-only memory tools the model
+  the recall hook put into prompts, the read-only memory tools the model
   called, and the facts capture stored. The Claude Code plugin shows them in
   a status line. This plugin has no status line, so here they are only a
   record. A file untouched for 14 days is removed.
