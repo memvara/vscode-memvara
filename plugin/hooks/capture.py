@@ -1,8 +1,18 @@
 #!/usr/bin/env python3
 """Stop — mine the turn that just ended for anything worth knowing next week.
 
-This runs once per turn and looks at one turn: the prompt the user typed and the reply it
-got. Nothing earlier, because the earlier turns were mined when they happened.
+This runs once per turn and mines one turn: the prompt the user typed and the reply it
+got. Nothing earlier is mined, because the earlier turns were mined when they happened.
+
+**Agentic capture is the default way to mine it** (`lib/agentic.py`, switch
+`agentic_capture`). The headless agent command gets read-only access to the user's memory
+for one run, searches it a few times, and returns proposals: a new fact, a replacement of
+a stored claim, the end of a stored claim, or a link between two claims. This hook checks
+each proposal and applies the ones that pass through its own write paths. The model is
+also shown up to 4,000 characters of the turns before this one, marked as already mined,
+so that a short reply can be read against the question it answers; nothing is taken from
+that window. When the agentic run cannot use the store, fails or times out, the turn gets
+the single-call extraction described below instead, and `capture.log` says so.
 
 It mines both halves because they hold different things. The prompt carries standing
 instructions, the reply carries what was decided and where it landed, and a fact usually
@@ -46,6 +56,11 @@ Per-turn costs more and loses nothing. The two guards that remain:
   and a refusal raises rather than returning quietly. See `lib/write.py`.
 * **It repeats.** `Stop` can fire more than once over one reply, so the size of the
   transcript at the last run is recorded and an unchanged size means there is nothing new.
+
+Two smaller jobs ride along. The hosted client sends the project worked out from the
+repository's remote (`lib.project.bind`) with every write. And the number of facts a turn
+stored is added to the session's `captured` count for the status line (`lib.counts`), after
+the write succeeds and never before.
 """
 
 from __future__ import annotations
@@ -59,9 +74,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from core.envelope import read_event  # noqa: E402
 from core.host import active  # noqa: E402
+from lib import agentic, counts, settings  # noqa: E402
 from lib.extract import project_subject, triples  # noqa: E402
 from lib.ipc import payload  # noqa: E402
-from lib.transcript import last_turn_with_injections  # noqa: E402
+from lib.project import bind as bind_project  # noqa: E402
+from lib.transcript import last_turn_with_context  # noqa: E402
 from lib.write import (EPISODE_ROLE, log, open_writer, store_facts,  # noqa: E402
                        turn_ids)
 
@@ -194,13 +211,16 @@ def _write_state(state: dict) -> None:
         pass
 
 
-def _turn(transcript: Path) -> "tuple[str, list[str]]":
-    """The turn that just ended, and the memories this plugin injected into it.
+def _turn(transcript: Path) -> "tuple[str, list[str], str]":
+    """The turn that just ended, the memories this plugin injected into it, and context.
 
     The second half is not decoration. Recall puts stored notes in front of the model
     before it replies; if the reply restates one, mining it writes the store's own output
     back into the store as though it were something new. Handing them to the extractor is
     what lets it tell an observation from an echo.
+
+    The third is up to `agentic.CONTEXT_CHARS` of the turns before this one. Only agentic
+    capture reads it, as reference: those turns were mined when they ended.
     """
     try:
         size = transcript.stat().st_size
@@ -208,9 +228,10 @@ def _turn(transcript: Path) -> "tuple[str, list[str]]":
             fh.seek(max(0, size - TAIL_BYTES))
             raw = fh.read()
     except OSError:
-        return "", []
-    text, injected = last_turn_with_injections(raw)
-    return (text[-MAX_TURN_CHARS:] if len(text) > MAX_TURN_CHARS else text), injected
+        return "", [], ""
+    text, injected, context = last_turn_with_context(raw, agentic.CONTEXT_CHARS)
+    text = text[-MAX_TURN_CHARS:] if len(text) > MAX_TURN_CHARS else text
+    return text, injected, context
 
 
 def main() -> int:
@@ -223,6 +244,9 @@ def main() -> int:
     if event.reentrant:
         # Re-entry from a hook-triggered continuation. Mining here would double-count.
         return 0
+    # Before anything else that can be slow: a config an earlier, killed capture left
+    # behind holds a credential, and this is the next moment anything can remove it.
+    agentic.sweep_configs()
 
     if not event.transcript_path:
         return 0
@@ -240,7 +264,7 @@ def main() -> int:
         # Stop fired twice over one reply. Nothing has been added since the last run.
         return 0
 
-    turn, injected = _turn(transcript)
+    turn, injected, context = _turn(transcript)
     if not turn.strip():
         log("no turn to mine")
         return 0
@@ -255,6 +279,8 @@ def main() -> int:
         log(f"turn={len(turn)}c skipped={why}")
         return 0
 
+    # Before the store is opened: the hosted client sends this project with every write.
+    bind_project(event.cwd)
     store, close = open_writer()
     if store is None:
         log(f"turn={len(turn)}c stored=0 failed=no store or login")
@@ -262,6 +288,17 @@ def main() -> int:
 
     try:
         kept, turn_of = _keep_turn(store, turn, event.cwd)
+        outcome = None
+        if settings.enabled("agentic_capture"):
+            # None means the agentic run could not use the store, and it has already
+            # logged why. The turn then gets today's single-call extraction instead.
+            outcome = agentic.capture(store, turn, context, event.cwd or None, injected,
+                                      hosted=close is not None, sources=turn_of)
+        if outcome is not None:
+            _log_agentic(turn, outcome, kept)
+            if outcome.applied.stored and counts.enabled():
+                counts.bump(event.session, "captured", outcome.applied.stored)
+            return 0
         facts = triples(turn, event.cwd or None, injected=injected)
         if not facts:
             log(f"turn={len(turn)}c facts=0 episode={'yes' if kept else 'no'}")
@@ -275,8 +312,26 @@ def main() -> int:
     log(f"turn={len(turn)}c facts={len(facts)} stored={stored} "
         f"episode={'yes' if kept else 'no'}"
         + ("; failed=" + "; ".join(failed) if failed else ""))
+    if stored and counts.enabled():
+        counts.bump(event.session, "captured", stored)
 
     return 0
+
+
+def _log_agentic(turn: str, outcome: "agentic.Outcome", kept: bool) -> None:
+    """The one line an agentic turn leaves in capture.log, in the single-call line's shape.
+
+    `stored` counts facts written, new or replacing an old value, which is also what the
+    status line's `captured` count adds; `replaced` says how many of those ended a stored
+    claim by id. Ends and links are counted separately because they write no fact.
+    """
+    applied = outcome.applied
+    log(f"turn={len(turn)}c agentic searches={outcome.searches} "
+        f"proposals={outcome.proposed} refused={outcome.refused} "
+        f"stored={applied.stored} replaced={applied.replaced} ended={applied.ended} "
+        f"linked={applied.linked} "
+        f"episode={'yes' if kept else 'no'}"
+        + ("; failed=" + "; ".join(applied.failed) if applied.failed else ""))
 
 
 def _keep_turn(store: object, turn: str, cwd: str) -> "tuple[bool, list[str]]":

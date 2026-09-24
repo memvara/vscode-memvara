@@ -35,6 +35,9 @@ import os
 import os.path
 import socket
 
+from .project import ENV as PROJECT_ENV
+from .state_file import read_json, write_json
+
 # `pathlib` is deliberately absent. Importing it costs 10.5ms measured, against a client
 # whose entire budget is ~30ms, and every path here is a string join and a stat. `open.py`
 # still uses it freely — that module is only reached on the fallback path, where 10ms is
@@ -107,14 +110,9 @@ def _read_json_file(path: str) -> dict:
     """A dict from a JSON file, or `{}` for anything short of one -- missing, unreadable,
     corrupt, or holding some other JSON shape entirely. Shared by `_read_alert` and
     `_read_notified_alert`: same file shape, same failure handling, same reason for it --
-    only the path differs.
+    only the path differs. The reading itself is `lib.state_file.read_json`.
     """
-    try:
-        with open(path, encoding="utf-8") as fh:
-            data = json.load(fh)
-    except (OSError, ValueError):
-        return {}
-    return data if isinstance(data, dict) else {}
+    return read_json(path)
 
 
 def _write_json_file_atomic(path: str, data: dict, tmp_prefix: str,
@@ -136,26 +134,12 @@ def _write_json_file_atomic(path: str, data: dict, tmp_prefix: str,
     saying why it stopped working. Omitted (empty string) for `_write_alert`, unchanged from
     before this helper existed, since that failure mode was already reviewed and accepted
     on its own terms.
-    """
-    import tempfile
 
-    try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=tmp_prefix)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump(data, fh)
-            os.replace(tmp, path)
-        except OSError:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            if log_name:
-                log_line(log_name, f"write failed: {os.path.basename(path)}")
-    except OSError:
-        if log_name:
-            log_line(log_name, f"write failed: {os.path.basename(path)}")
+    The write itself is `lib.state_file.write_json`, which the other hook state files use
+    too; it removes its temporary file when the rename fails.
+    """
+    if not write_json(path, data, tmp_prefix) and log_name:
+        log_line(log_name, f"write failed: {os.path.basename(path)}")
 
 
 def _read_alert() -> dict:
@@ -459,7 +443,25 @@ def server_env() -> "dict[str, str]":
 
     Empty when no client config names a memvara server. This is discovery, not validation
     — whatever is found goes to `ServerConfig.from_env`, which decides if it is usable.
+
+    Read at most once per process. A client config can be large, and one prompt used to
+    parse it twice: once for the daemon's address and once to decide on a query rewrite.
+    The answer is kept for the config paths it was read from, so a caller that points
+    `_CLIENT_CONFIGS` elsewhere, as the tests do, reads the new files. A copy is returned,
+    so a caller that changes it cannot change the next caller's answer.
     """
+    global _SERVER_ENV
+    if _SERVER_ENV is None or _SERVER_ENV[0] != _CLIENT_CONFIGS:
+        _SERVER_ENV = (_CLIENT_CONFIGS, _read_server_env())
+    return dict(_SERVER_ENV[1])
+
+
+#: `(config paths, env block)` from the first call to `server_env` in this process.
+_SERVER_ENV: "tuple[tuple[str, ...], dict[str, str]] | None" = None
+
+
+def _read_server_env() -> "dict[str, str]":
+    """The client config files' memvara env block, read from disk. See `server_env`."""
     for path in _CLIENT_CONFIGS:
         try:
             with open(path, encoding="utf-8") as fh:
@@ -478,6 +480,19 @@ def server_env() -> "dict[str, str]":
     return {}
 
 
+def client_env() -> "dict[str, str]":
+    """The environment the memvara MCP server would be started with, as a hook sees it.
+
+    The client's server block (`server_env`), with every variable set in this process
+    winning over it. Someone who exports `MEMVARA_DB` to point a session at a scratch store
+    means it. This is the one place that rule is written: the daemon's address
+    (`store_key`), the store a hook opens (`lib.open.open_store`) and the model the recall
+    hook checks before a rewrite (`lib.read_model.configured`) all read it from here, so
+    the three cannot disagree about which store or which model they mean.
+    """
+    return {**server_env(), **os.environ}
+
+
 def store_key() -> str:
     """Identity of the store this process would open, without opening it.
 
@@ -493,7 +508,7 @@ def store_key() -> str:
     store-separation failure again, arriving through a door the rest of this key cannot
     see because it is computed after the host has already chosen where to look.
     """
-    env = {**server_env(), **{k: v for k, v in os.environ.items() if k.startswith("MEMVARA_")}}
+    env = client_env()
     db = env.get("MEMVARA_DB") or ""
     if db and db != ":memory:":
         try:
@@ -512,10 +527,17 @@ def store_key() -> str:
         except (OSError, ValueError):
             hosted = ""
 
+    # The project the hook bound (`lib.project.bind`), for a hosted store only. The hosted
+    # client sends it as a header on every call, so a daemon started from one repository
+    # would otherwise answer prompts from another with the first one's project. The local
+    # route does not read it, so a local store keeps one daemon for every repository.
+    project = "" if db else env.get(PROJECT_ENV, "")
+
     return "\0".join([
         _host_record().id,
         db,
         hosted,
+        project,
         env.get("MEMVARA_MODE", ""),
         env.get("MEMVARA_TENANT", ""),
         env.get("MEMVARA_USER", ""),

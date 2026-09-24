@@ -179,6 +179,20 @@ ALLOWED_HOOK_FILES = {
     "js/shim.mjs", "js/opencode.mjs",
     "lib/__init__.py", "lib/extract.py", "lib/fast.py", "lib/hosted.py", "lib/ipc.py",
     "lib/open.py", "lib/standing.py", "lib/transcript.py", "lib/usage.py", "lib/write.py",
+    # Added with the 0.15.0 sync, and read before being listed. `lib/project.py` works
+    # out the git project the hooks send to the server, and `lib/project_vectors.json` is
+    # data, not code: the remote URLs and the project each must resolve to, which the
+    # library's own copy is tested against too. `lib/counts.py` keeps per-session counts
+    # for a status line, `lib/mark.py` starts every injected memory line with a mark so
+    # capture never stores it again, `lib/settings.py` reads the on/off switches in
+    # `~/.memvara/settings.json`, and `lib/state_file.py` does the locked, atomic writes
+    # those files need. `lib/read_model.py` lets the recall hook rewrite a query only
+    # after a model key check is on record. `lib/agentic.py` is agentic capture, which
+    # runs only when the first extractor is `claude`; with `--host copilot` this client's
+    # own CLI comes first, so it stays inert here.
+    "lib/agentic.py", "lib/counts.py", "lib/mark.py", "lib/project.py",
+    "lib/project_vectors.json", "lib/read_model.py", "lib/settings.py",
+    "lib/state_file.py",
     "tools/__init__.py", "tools/generate.py",
 }
 

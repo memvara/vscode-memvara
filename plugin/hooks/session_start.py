@@ -39,6 +39,13 @@ from core.host import Reply, active  # noqa: E402
 from lib.ipc import (  # noqa: E402
     due_capture_alert, payload, plural, status, under_extraction, with_alert,
 )
+from lib import counts, project  # noqa: E402
+from lib.agentic import sweep_configs as sweep_capture_configs  # noqa: E402
+from lib.fast import read_kinds  # noqa: E402
+from lib.mark import count as count_memories  # noqa: E402
+from lib.mark import mark_block  # noqa: E402
+from lib.mark import on as mark_on  # noqa: E402
+from lib.project import bind as bind_project  # noqa: E402
 from lib.standing import standing_block  # noqa: E402
 from lib.write import open_writer  # noqa: E402
 
@@ -130,7 +137,7 @@ def _hosted_binding(store: object) -> str:
     for line in report.splitlines():
         line = line.strip()
         if line.startswith("scope:"):
-            # "scope: tenant/user/agent/session  (tenant/user/...; '*' means unbound)"
+            # "scope: tenant/user/project/agent/session  (...; '*' means unbound)"
             scope = line[len("scope:"):].strip().split()[0]
         elif line.startswith("visible at this scope:"):
             visible = line[len("visible at this scope:"):].strip()
@@ -140,8 +147,11 @@ def _hosted_binding(store: object) -> str:
 
 
 def _binding_line(scope: str, visible: str) -> str:
-    line = (f"Memvara scope: {scope} (tenant/user/agent/session; '*' means unbound), "
-            f"{visible} visible.")
+    # Five parts, because `Scope.key()` joins five: tenant, user, project, agent and
+    # session. The label said four for as long as the key had a project in it, so a reader
+    # matching the parts to the names got every name after `user` wrong.
+    line = (f"Memvara scope: {scope} (tenant/user/project/agent/session; '*' means "
+            f"unbound), {visible} visible.")
     if not scope.endswith("*"):
         # The session segment is bound, so anything written now is invisible to the next
         # session. Say so here rather than letting it be discovered by a lost fact.
@@ -185,6 +195,16 @@ def main() -> int:
     # which `_mine` treats as "user notes only" -- the safe direction, since the failure it
     # avoids is carrying another project's instructions into this one.
     cwd = read_event(host, "session_start", payload()).cwd
+    # Before the store is opened: the hosted client sends this project with every call.
+    bind_project(cwd)
+    # Once per session rather than on every write: the per-session counters and the
+    # per-directory project cache only grow, and this hook runs once when a session opens.
+    counts.prune()
+    project.prune()
+    # A capture that was killed mid-run leaves its MCP config behind, holding the hosted
+    # API key or the store's environment. Capture removes old ones too, but a session that
+    # never gets as far as a mined turn would otherwise keep them. See `lib.agentic`.
+    sweep_capture_configs()
     store, close = open_writer()
     if store is None:
         _emit(Reply("session_start", status=status("not configured")))
@@ -194,9 +214,16 @@ def main() -> int:
     # backend answers -- local library first, hosted second -- which is exactly what this
     # hook needs and what it used to be missing.
     hosted = close is not None
+    # Both reads below are of a fixed sentence at every session start, so they are plain
+    # reads: a model rewrite of the same words each time would cost a call and could
+    # return a different block from one session to the next. The library's store takes
+    # `query_rewrite` unless it was released before query rewrite, which never rewrites.
+    # The stdlib hosted client takes no such argument and always asks for a plain read.
+    plain_read: dict = {} if hosted else read_kinds(store)[0]
     #: What a section could not be fetched for, in words. Set before the `try` so that
     #: every path to the banner below has it, including the ones that leave early.
     missing = ""
+    mark = mark_on()
     try:
         parts = []
         binding = _hosted_binding(store) if hosted else _local_binding(store)
@@ -207,7 +234,7 @@ def main() -> int:
             return str(store.recall(QUERY, k=STANDING_K,
                                     budget=STANDING_FALLBACK_TOKENS,
                                     header=STANDING_HEADER,
-                                    memory_types=STANDING) or "")
+                                    memory_types=STANDING, **plain_read) or "")
 
         try:
             standing = standing_block(store, hosted=hosted, budget=STANDING_BUDGET,
@@ -216,11 +243,13 @@ def main() -> int:
         except Exception:
             standing = ""
         if standing.strip():
-            parts.append(standing.rstrip())
+            # Marked here as well as in `render`, because the legacy fallback returns the
+            # server's own block, whose bullets carry no mark. Marking twice is harmless.
+            parts.append(mark_block(standing.rstrip(), mark))
 
         try:
             notes = str(store.recall(QUERY, k=K, budget=BUDGET, header=HEADER,
-                                     include_episodes=True) or "")
+                                     include_episodes=True, **plain_read) or "")
         except Exception as exc:
             # "Empty" and "could not ask" are not the same block, and collapsing them here
             # was worse than the same bug in `recall.py`: that one at least said it had
@@ -230,7 +259,7 @@ def main() -> int:
             # became two and 13,541, with the banner unchanged.
             notes, missing = "", _why(exc)
         if notes.strip():
-            parts.append(notes.rstrip())
+            parts.append(mark_block(notes.rstrip(), mark))
     finally:
         if close is not None:
             close()
@@ -243,7 +272,7 @@ def main() -> int:
         _emit(Reply("session_start", status=status(missing or "nothing stored yet")))
         return 0
 
-    count = sum(1 for line in "\n\n".join(parts).splitlines() if line.startswith("- "))
+    count = count_memories("\n\n".join(parts))
     opened = (f"session opened with {plural(count)}" if count else "session opened")
     # A count is a claim about what arrived. Saying it while a section is missing is the
     # failure this hook had; naming what is absent is the whole fix.
