@@ -43,6 +43,40 @@ child is gone once it has written. Nothing is left resident, no daemon is
 required, and no memory leaves your machine except through the same
 hosted endpoint the MCP server already uses.
 
+### What else the hooks keep and send
+
+The hooks are copied from memvara/memvara v0.15.0, and `hooks.lock` names the
+exact commit. Besides the logs, they keep two kinds of small file in
+`~/.memvara/.hooks/`:
+
+- `projects/` holds the git project of each directory the hooks ran in, for
+  one hour. The project is the repository's `origin` remote, written as
+  `host/owner/repo`, or `path:` and a hash of the repository root when there
+  is no remote. On the hosted server the hooks send it with every call, in a
+  `Memvara-Project` header, so that memories are kept per repository.
+- `counts/` holds one file per session with three numbers: the memory lines
+  the recall hook put into prompts, the read-only memory tools the model
+  called, and the facts capture stored. The Claude Code plugin shows them in
+  a status line. This plugin has no status line, so here they are only a
+  record. A file untouched for 14 days is removed.
+
+Every memory line the hooks put in front of the model starts with `⋈`, and
+capture ignores lines that start with it, so a recalled memory is not stored
+a second time.
+
+You can switch each of these off in `~/.memvara/settings.json`, a JSON object
+of `true` and `false` values in which a missing key means on: `project_scope`
+for the project header, `status_line` for the counts, and `recall_mark` for
+the mark. Setting `MEMVARA_FEATURE_<NAME>` to `0` or `1` in the environment
+overrides the file.
+
+The Claude Code plugin also has agentic capture, where capture searches your
+memory before it proposes changes. It runs only when `claude -p` is the first
+extractor, and here `copilot -p` is. Capture here still reads each turn with one
+call, and each turn's `capture.log` entry includes a line saying that agentic
+capture was skipped. Setting `"agentic_capture": false` in the same file stops
+that line.
+
 ### Two things that can make recall arrive and not land
 
 Both measured against Copilot CLI 1.0.82, both outside this plugin's

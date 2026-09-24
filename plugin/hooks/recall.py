@@ -34,9 +34,28 @@ turn 5, so injecting it again buys nothing and spends budget that a genuinely ne
 could have had. Hashes of what has already gone in are kept per session and filtered out,
 so a follow-up gets whatever is new and a banner saying how much it already had.
 
-It does not write. Recording what was said is the `Stop` hook's job, over the prompt and
-the reply together, in one run: two runs per turn cost twice as much and each saw half the
-evidence.
+**It marks what it injects.** Every memory line starts with `⋈ ` (see `lib.mark`), so a
+reader can tell recalled memory from the rest of the context and capture can drop it. The
+dedup hash is taken over the line without the mark, so a session's record of what it has
+already seen is still valid after the mark was introduced.
+
+**It says which project it is asking for.** `lib.project.bind` works out the project from
+the remote of the session's repository, and the hosted client sends it with every call.
+
+**It asks a model to rewrite the query only when setup verified a key.** A local store whose
+model can chat can rewrite each query before it searches, at one model call per prompt.
+This hook asks for that only when `lib.read_model.allowed()` says `/memvara:setup
+verify-key` checked the configured model and the `query_rewrite` switch is on, and only when
+enough of its budget is left to wait `REWRITE_WAIT_SEC` for it. Every other prompt is a
+plain read. A rewrite that fails, is refused or runs past the wait serves the plain read, so
+the prompt gets its memories either way. The episode-widening retry is always plain, and
+this hook never asks for a summary (`synthesis`): both would be further model calls on the
+same prompt.
+
+It does not write memory. Recording what was said is the `Stop` hook's job, over the prompt
+and the reply together, in one run: two runs per turn cost twice as much and each saw half
+the evidence. It does add the number of lines it injected to the session's `recalled`
+count for the status line (`lib.counts`).
 """
 
 from __future__ import annotations
@@ -53,11 +72,19 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from core.envelope import read_event, write  # noqa: E402
 from core.host import Reply, active  # noqa: E402
+from lib import counts, state_file  # noqa: E402
+from lib.fast import REWRITE_WAIT_SEC  # noqa: E402
 from lib.fast import recall as fast_recall  # noqa: E402
 from lib.ipc import (  # noqa: E402
     due_alert_for_model, due_capture_alert, log_line, payload, plural, status,
     under_extraction, with_alert,
 )
+from lib.mark import count as count_memories  # noqa: E402
+from lib.mark import marked  # noqa: E402
+from lib.mark import on as mark_on  # noqa: E402
+from lib.mark import unmark_block  # noqa: E402
+from lib.project import bind as bind_project  # noqa: E402
+from lib.read_model import allowed as rewrite_allowed  # noqa: E402
 
 #: The client this process is answering, resolved once. `run.py` binds it before importing
 #: this module; a bare `python3 recall.py` gets Claude Code, which is what that invocation
@@ -287,11 +314,25 @@ HEADER = (
 
 
 def _digest(line: str) -> str:
+    """The dedup hash of one memory line. Always taken over the line WITHOUT the mark.
+
+    Callers hash the bullet as the server rendered it, before `lib.mark` puts `⋈ ` in front.
+    Hashing the marked line instead would make every memory a session had already seen look
+    new on the first prompt after the upgrade, and inject all of them again.
+    """
     return hashlib.sha256(" ".join(line.split()).encode("utf-8")).hexdigest()[:16]
 
 
+def _count_recalled(session: str, n: int) -> None:
+    """Add `n` injected memory lines to this session's status-line count."""
+    if n and counts.enabled():
+        counts.bump(session, "recalled", n)
+
+
 def _seen_path(session: str) -> "str | None":
-    if not session or "/" in session or session in (".", ".."):
+    # A NUL byte makes every `os` call raise `ValueError`, not the `OSError` the state
+    # functions below are written to absorb, so such an id gets no state file at all.
+    if not session or "/" in session or "\0" in session or session in (".", ".."):
         return None
     return os.path.join(SEEN_DIR, f"{session}.json")
 
@@ -310,6 +351,11 @@ def _state_json(session: str) -> dict:
             data = json.load(fh)
     except (OSError, ValueError):
         return {}
+    return _normalised(data)
+
+
+def _normalised(data: object) -> dict:
+    """A state file's contents as a dict, reading the old bare-list format too."""
     if isinstance(data, list):
         return {"seen": [h for h in data if isinstance(h, str)]}
     return data if isinstance(data, dict) else {}
@@ -346,18 +392,7 @@ def _prune_seen(now: float) -> None:
     the one event that already writes to this directory, and a failure is ignored, because
     a tidy directory is worth strictly less than an answered prompt.
     """
-    try:
-        for name in os.listdir(SEEN_DIR):
-            if not name.endswith(".json"):
-                continue
-            path = os.path.join(SEEN_DIR, name)
-            try:
-                if now - os.path.getmtime(path) > SEEN_TTL_SECONDS:
-                    os.unlink(path)
-            except OSError:
-                continue
-    except OSError:
-        pass
+    state_file.prune(SEEN_DIR, SEEN_TTL_SECONDS, now)
 
 
 def _write_state(session: str, hashes: "list[str]", query: str,
@@ -369,22 +404,35 @@ def _write_state(session: str, hashes: "list[str]", query: str,
     with the standing set. Passing None from those would silently reset the refresh clock
     on every turn and re-inject the whole standing block each time -- the failure this is
     supposed to prevent, arriving through the tidier-looking signature.
+
+    The read and the write happen under one lock and the write is atomic (see
+    `lib.state_file`). Two prompts in one session can be answered at the same moment, and a
+    plain rewrite let the second drop the hashes the first had just added. Hashes already
+    in the file and missing from `hashes` are therefore kept, ahead of the caller's, so the
+    newest survive the `MAX_SEEN` cut.
+
+    Dedup and carry-forward are both optimisations. Losing them repeats a memory or weakens
+    one query; failing the prompt over it would be the larger bug, so nothing here raises.
     """
     path = _seen_path(session)
     if path is None:
         return
-    was_digest, was_at = _read_standing(session)
-    digest, at = standing if standing is not None else (was_digest, was_at)
-    try:
-        os.makedirs(SEEN_DIR, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as fh:
-            json.dump({"seen": hashes[-MAX_SEEN:], "query": query[:MAX_CARRY_CHARS],
-                       "standing": digest, "standing_at": at}, fh)
+
+    def change(raw: object) -> dict:
+        was = _normalised(raw)
+        kept = set(hashes)
+        earlier = [h for h in was.get("seen") or [] if isinstance(h, str) and h not in kept]
+        was_digest = was.get("standing")
+        was_at = was.get("standing_at")
+        digest, at = standing if standing is not None else (
+            was_digest if isinstance(was_digest, str) else "",
+            float(was_at) if isinstance(was_at, (int, float)) else 0.0)
+        return {"seen": (earlier + list(hashes))[-MAX_SEEN:],
+                "query": query[:MAX_CARRY_CHARS], "standing": digest, "standing_at": at}
+
+    if state_file.update_json(path, change, lock_path=os.path.join(SEEN_DIR, ".lock"),
+                              prefix=".recalled-"):
         _prune_seen(time.time())
-    except OSError:
-        # Dedup and carry-forward are both optimisations. Losing them repeats a memory or
-        # weakens one query; failing the prompt over it would be the larger bug.
-        pass
 
 
 def _anaphoric(prompt: str) -> bool:
@@ -581,7 +629,10 @@ def _standing_refresh(session: str, now: float, cwd: str = "") -> "tuple[str, tu
         # the next one either.
         return "", (digest, now)
 
-    fresh = _digest(block)
+    # Hashed without the recall mark, as `_digest` promises: the mark is presentation, and
+    # hashing it made every running session report "standing preferences updated" once
+    # after the upgrade and again each time the `recall_mark` switch changed.
+    fresh = _digest(unmark_block(block))
     if not block.strip() or fresh == digest:
         return "", (digest or fresh, now)
     return block.rstrip(), (fresh, now)
@@ -591,11 +642,25 @@ def _standing_refresh(session: str, now: float, cwd: str = "") -> "tuple[str, tu
 #: `quota:2026-09-01` when the refusal named the instant the period rolls over.
 _QUOTA = "quota"
 
+#: A plan's daily recall allowance used up, as `lib.fast` hands it over: `daily` alone,
+#: `daily:12600` with the seconds until it resets, or `daily:00:00` with the reset time in
+#: UTC.
+_DAILY = "daily"
+
 #: Month names for the one date this file renders. `datetime.strftime` would do it in a
 #: line and cost an import on a path measured at ~30ms, where `import datetime` is a
 #: measurable share of the budget. Twelve strings are cheaper than a module.
 _MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
            "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+
+def _wait(seconds: int) -> str:
+    """`3 h 30 min`, `2 h`, `5 min`: a wait in the units a person reads, rounded up."""
+    minutes = max(1, -(-seconds // 60))
+    hours, minutes = divmod(minutes, 60)
+    if not hours:
+        return f"{minutes} min"
+    return f"{hours} h {minutes} min" if minutes else f"{hours} h"
 
 
 def _quota_line(why: str) -> str:
@@ -604,7 +669,20 @@ def _quota_line(why: str) -> str:
     Says *retrieval* rather than the metric's own name: `retrieval.query` is what the
     server meters and not a phrase anyone reads. Says the reset date because "spent" on
     its own reads as "broken, retry later", and retrying is precisely what will not work.
+
+    A paid plan's allowance is per day, and used to be reported as "recall failed": the
+    service refuses it with the same 429 and code as a plain rate limit, and nothing here
+    looked further. It now says the allowance for today is used up, and how long until it
+    resets when the refusal said.
     """
+    if why.startswith(_DAILY):
+        _, _, when = why.partition(":")
+        line = "today's recall allowance is used up"
+        if when.isdigit():
+            return f"{line} — resets in {_wait(int(when))}"
+        if len(when) == 5 and when[2] == ":":
+            return f"{line} — resets at {when} UTC"
+        return line
     if not why.startswith(_QUOTA):
         return ""
     _, _, when = why.partition(":")
@@ -713,6 +791,10 @@ def main() -> int:
         log_line("recall", "skipped=machine prompt")
         return 0
 
+    # Before anything that can reach the hosted store or the daemon: both are addressed by
+    # the project, and the header on every hosted call comes from what this sets.
+    bind_project(event.cwd)
+
     # Read once, then every reply from here on goes through `_emit` rather than
     # `write` threaded by hand through each call site -- a first version wrapped five
     # separate sites individually, and only one of the five was ever covered by a test; a
@@ -768,9 +850,16 @@ def main() -> int:
     # of blindness for another. The carried text goes first because it is the topic.
     query = f"{carried} {prompt}".strip() if (anaphoric and carried) else prompt
 
+    # A rewrite is started only when the hook can afford to wait for it: the model call may
+    # take `REWRITE_WAIT_SEC` before the plain read is served, and the harness kills the
+    # hook at 10 seconds with nothing printed. The clock is compared first: it is free,
+    # and the decision reads files.
+    rewrite = (time.monotonic() - start + REWRITE_WAIT_SEC < OVERALL_BUDGET_SEC
+               and rewrite_allowed())
     try:
         block, ok, why = fast_recall(query, k=K, budget=BUDGET, header=HEADER,
-                                     min_score=_min_score())
+                                     min_score=_min_score(), query_rewrite=rewrite,
+                                     rewrite_wait=REWRITE_WAIT_SEC)
     except Exception:
         # A retrieval failure must not become a failed prompt.
         block, ok, why = "", False, ""
@@ -803,16 +892,17 @@ def main() -> int:
         # The structured layer had little to say. Ask again for the raw turns too --
         # narrative excerpts cannot outrank claims that are not there.
         #
-        # On the hosted endpoint this is currently a no-op: `include_episodes` is the only
-        # boolean argument in the tool surface and the server's validator has no branch for
-        # that type, so it raises and the client retries without it. It costs one round
-        # trip on an already-thin prompt, and it starts working the day the server is
-        # fixed, with no release here.
+        # On the hosted endpoint this is one more request, and one more recall counted
+        # against the plan's allowance. The hosted client sends it once: it leaves off any
+        # argument the server's `tools/list` does not declare, rather than sending it and
+        # retrying without it (`lib.hosted.HostedRecall.recall`).
         if time.monotonic() - start < OVERALL_BUDGET_SEC:
             try:
+                # Plain: a rewrite here would be a second model call on one prompt.
                 wider, wider_ok, _ = fast_recall(query, k=EPISODE_K, budget=EPISODE_BUDGET,
                                                  header=HEADER, include_episodes=True,
-                                                 min_score=_min_score())
+                                                 min_score=_min_score(),
+                                                 query_rewrite=False)
             except Exception:
                 wider, wider_ok = "", False
             if wider_ok and wider:
@@ -847,6 +937,7 @@ def main() -> int:
             # happens to match something.
             _emit(Reply("recall", status=status("standing preferences updated"),
                         context=standing))
+            _count_recalled(session, count_memories(standing))
             return 0
         _emit(Reply("recall", status=note))
         return 0
@@ -857,7 +948,8 @@ def main() -> int:
     # memory, not the excerpt, or raising MAX_INJECTED_CHARS would make everything already
     # in context look new.
     clipped = [_clip(line) for line in fresh]
-    lines = [header] + clipped
+    mark = mark_on()
+    lines = [header] + [marked(line, mark) for line in clipped]
     if any(short != full for short, full in zip(clipped, fresh)):
         lines.append(MORE)
     block_text = "\n".join(lines)
@@ -872,6 +964,7 @@ def main() -> int:
         f"clipped={sum(1 for s_, f_ in zip(clipped, fresh) if s_ != f_)}")
     _sample(prompt, fresh, anaphoric=anaphoric and bool(carried))
     _emit(Reply("recall", status=label, context=block_text))
+    _count_recalled(session, count_memories(block_text))
     return 0
 
 
