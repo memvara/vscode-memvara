@@ -111,7 +111,7 @@ are agents, skills, hooks, MCP servers and LSP servers — so there is no
 host.
 
 The MCP config is `plugin/.mcp.json` and the key is `mcpServers`. Both
-halves were wrong here until this release — the file was `mcp.json` and
+halves were wrong here until 0.2.4 — the file was `mcp.json` and
 the key was `servers` — and the effect was not a parse error but silence:
 the server never appeared in Copilot's loaded list, so the skill kept
 telling the model to use `memory_*` tools that had never been registered.
