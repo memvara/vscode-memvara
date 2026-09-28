@@ -193,6 +193,13 @@ ALLOWED_HOOK_FILES = {
     "lib/agentic.py", "lib/counts.py", "lib/mark.py", "lib/project.py",
     "lib/project_vectors.json", "lib/read_model.py", "lib/settings.py",
     "lib/state_file.py",
+    # Added with the 0.17.0 sync, and read before being listed. `lib/private.py` creates
+    # every directory under `~/.memvara` as 0700 and every file as 0600, and takes the
+    # group and other permissions off ones that already exist. `lib/deadline.py` holds one
+    # deadline for a whole hook process, so recall and session start stop making hosted
+    # calls before the host's time limit. `lib/toml_servers.py` reads the MCP server
+    # tables in Codex's `config.toml`, so the hooks find a local store configured there.
+    "lib/deadline.py", "lib/private.py", "lib/toml_servers.py",
     "tools/__init__.py", "tools/generate.py",
 }
 
@@ -398,23 +405,22 @@ class Hooks(unittest.TestCase):
         from a server configured as `memvara` reached the hook as `memvara-memory_recall`.
 
         Both halves matter and neither is Claude Code's. An unanchored `memvara`, which is
-        exactly what the sibling Cursor record uses, matches NOTHING here; and a separator
-        of `__` leaves the leaf as the whole string, so `_tool_leaf` never finds a
-        read-only tool name and nothing is ever auto-approved.
+        exactly what the sibling Cursor record uses, matches NOTHING here; and Claude
+        Code's prefix `mcp__memvara__` never begins this client's tool names, so
+        `approve.py` would never find a read-only tool and nothing would be auto-approved.
+        Since memvara 0.17.0 the hook approves a tool only when its whole name is one of
+        the record's `prefixes` followed by a read-only tool's name.
         """
         host = self._record()
         name = "memvara-memory_recall"
         self.assertTrue(re.fullmatch(host.approve.matcher, name),
                         f"{host.approve.matcher!r} does not match {name!r} when anchored "
                         "the way this client anchors it")
-        leaf = name
-        for sep in host.approve.separators:
-            if sep in leaf:
-                leaf = leaf.rsplit(sep, 1)[-1]
-                break
-        self.assertEqual(leaf, "memory_recall",
-                         "the separators do not reduce this client's tool name to the "
-                         "bare tool, so approve.py can never recognise a read-only one")
+        self.assertTrue(
+            any(name.startswith(p) and name[len(p):] == "memory_recall"
+                for p in host.approve.prefixes),
+            f"no prefix in {host.approve.prefixes!r} reduces {name!r} to the bare tool, "
+            "so approve.py can never recognise a read-only one")
 
     def test_capture_is_not_registered_async_on_this_client(self) -> None:
         """`async: true` is accepted here and is NOT honoured: measured, a hook declared
